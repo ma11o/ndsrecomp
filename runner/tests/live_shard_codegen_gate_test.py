@@ -72,6 +72,18 @@ def runner_codegen_version(header: Path) -> int:
     return int(match.group(1))
 
 
+def _macos_sysroot_flags() -> list[str]:
+    """Xcode's toolchain `cc` finds even <string.h> only via a sysroot that
+    `xcrun` normally supplies; invoked directly (as CMAKE_C_COMPILER is here)
+    it has none, so every #include fails. clang on Linux and MinGW gcc on
+    Windows need no such flag."""
+    if sys.platform != "darwin":
+        return []
+    sdk = subprocess.run(["xcrun", "--show-sdk-path"], text=True,
+                         stdout=subprocess.PIPE).stdout.strip()
+    return ["-isysroot", sdk] if sdk else []
+
+
 def build_shard(work: Path, cc: str, implib_dir: Path, runner_test: Path,
                 codegen_version: int) -> Path:
     """One published shard in its own cache directory, at a given version."""
@@ -97,10 +109,20 @@ def build_shard(work: Path, cc: str, implib_dir: Path, runner_test: Path,
         "-I", str(ROOT / "external" / "arm-recomp-core" / "common"),
         "-o", str(stage), str(stub), str(wrapper),
     ]
+    command.extend(_macos_sysroot_flags())
     if sys.platform == "win32":
         command.extend([f"-L{implib_dir}", f"-l{runner_test.stem}"])
     else:
         command.insert(2, "-fPIC")
+        if sys.platform == "darwin":
+            # Unlike an ELF .so, a Mach-O bundle refuses to link with
+            # symbols left undefined by default. The shard binds to
+            # nds_runner's own g_cpu/g_busf_*/g_runtime_cycles only once
+            # dlopen()'d into that process (as a real shard does, and as
+            # live_overlay_preflight_test does below), so defer resolution
+            # to load time instead of requiring an import library the way
+            # the win32 branch above does.
+            command.extend(["-undefined", "dynamic_lookup"])
     result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
     if result.returncode != 0:

@@ -66,6 +66,12 @@ bool live_overlay_is_final_library_path(const std::filesystem::path& path) {
 
 std::string live_overlay_bundled_tcc_command(
     const std::filesystem::path& exe_dir) {
+    // Only Windows and Linux ship the bundled overlay_toolchain/ directory
+    // (see the packaging scripts); on any other host (e.g. macOS) there is no
+    // bundled python/tcc/nds_recompile to point at, so the whole lookup is
+    // skipped rather than declaring those paths without anything to fill
+    // them from.
+#if defined(_WIN32) || defined(__linux__)
     std::error_code ec;
     const auto toolchain = exe_dir / "overlay_toolchain";
 #if defined(_WIN32)
@@ -73,7 +79,7 @@ std::string live_overlay_bundled_tcc_command(
     const auto recompiler = toolchain / "nds_recompile.exe";
     const auto tcc = toolchain / "tcc" / "tcc.exe";
     const auto runner = exe_dir / "nds_runner.exe";
-#elif defined(__linux__)
+#else
     auto python = toolchain / "python" / "bin" / "python3";
     if (!std::filesystem::is_regular_file(python, ec)) {
         ec.clear();
@@ -82,8 +88,6 @@ std::string live_overlay_bundled_tcc_command(
     const auto recompiler = toolchain / "nds_recompile";
     const auto tcc = toolchain / "tcc" / "tcc";
     const auto runner = exe_dir / "nds_runner";
-#else
-    return {};
 #endif
     const auto script = toolchain / "compile_live_shards.py";
     const auto include = toolchain / "include";
@@ -104,4 +108,8 @@ std::string live_overlay_bundled_tcc_command(
         " --runner-exe " + shell_quote(runner) +
         " --compiler tcc --tcc " + shell_quote(tcc) +
         " --include-roots --min-hits 8";
+#else
+    (void)exe_dir;
+    return {};
+#endif
 }

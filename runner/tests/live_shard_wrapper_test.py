@@ -70,6 +70,18 @@ class BankInfo(ctypes.Structure):
     ]
 
 
+def _macos_sysroot_flags() -> list[str]:
+    """Xcode's toolchain `cc` finds even <string.h> only via a sysroot that
+    `xcrun` normally supplies; invoked directly (as CMAKE_C_COMPILER is here)
+    it has none, so every #include fails. clang on Linux and MinGW gcc on
+    Windows need no such flag."""
+    if sys.platform != "darwin":
+        return []
+    sdk = subprocess.run(["xcrun", "--show-sdk-path"], text=True,
+                         stdout=subprocess.PIPE).stdout.strip()
+    return ["-isysroot", sdk] if sdk else []
+
+
 def build(work: Path, gcc: str, cpu: int, static_cpu: int) -> Path:
     name = "arm9" if cpu == 9 else "arm7"
     bank = f"nds_live_{name}_02000000"
@@ -96,6 +108,7 @@ def build(work: Path, gcc: str, cpu: int, static_cpu: int) -> Path:
         "-I", str(ROOT / "external" / "arm-recomp-core" / "common"),
         "-o", str(dll), str(src / "stub.c"), str(wrapper),
     ]
+    command.extend(_macos_sysroot_flags())
     if sys.platform != "win32":
         command.insert(2, "-fPIC")
     result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
