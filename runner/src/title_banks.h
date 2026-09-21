@@ -6,3 +6,8 @@
 // NDS_TITLE_BANK_DIR, so the shared runtime does not name individual games or
 // assume a fixed number of overlay/runtime bank generations.
 bool nds_register_configured_title_banks(const char* rom_sha1);
+
+// Same SHA-1 gate, for whichever configured title banks were regenerated
+// with --hook-seams (docs/mod-hooks.md). Most title groups have no
+// <bank>_hooks.c at all, in which case this always returns false.
+bool nds_register_configured_title_hook_tables(const char* rom_sha1);

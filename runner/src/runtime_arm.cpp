@@ -38,6 +38,7 @@
 #include "coverage_manifest.h"
 #include "live_overlay.h"
 #include "pc_profile.h"
+#include "mod_hooks.h"
 
 // ── Dispatch-composition counters (always on; see dispatch_stats.h) ─────
 NdsDispatchStats g_nds_dispatch_stats[2] = {};
@@ -1583,6 +1584,14 @@ void runtime_dispatch_impl(uint32_t target_pc, NdsLinkSlot* linked) {
         // instruction set. ARM-state BX/BLX targets are word aligned;
         // preserving bit 1 manufactures impossible entries such as BIOS 0x2.
         uint32_t pc = target_pc & (thumb ? ~1u : ~3u);
+        // Mod-hook choke point 2/3: covers a should-return MISS (the CRS
+        // entry was evicted, or this transfer was never a paired call at
+        // all) and every other way this loop is entered -- including a
+        // scheduler slice resume, which is functionally "the CPU is at this
+        // PC with this SP" exactly as a real return would be. Firing
+        // consumes the watch, so a miss that ran the choke-point-1 check
+        // first cannot fire it twice here.
+        nds_mod_hooks_check_return(pc);
         ++g_nds_dispatch_stats[g_nds_active].dispatch_total;
         // WHICH guest code is being entered (pc_profile.h, NDS_PC_HOT_EXEC).
         // This one line is the whole exec population, and it sits here rather
@@ -2030,6 +2039,12 @@ extern "C" void runtime_call_push_return(uint32_t return_pc) {
 extern "C" int runtime_call_should_return(uint32_t target_pc) {
     uint32_t pc = target_pc & ~1u;
     uint32_t key = pc | ((g_cpu.cpsr & CPSR_T_BIT) ? 1u : 0u);
+    // Mod-hook choke point 1/3 (docs/mod-hooks.md "Leave: a return watch").
+    // Runs once here for both the CRS hit and miss outcome below -- a
+    // return watch is independent of whether the call-return stack itself
+    // paired this transfer, and firing removes the watch, so the dispatch
+    // choke point below cannot double-fire it on the same transfer.
+    nds_mod_hooks_check_return(pc);
     auto& stats = g_nds_dispatch_stats[g_nds_active];
     for (uint32_t i = g_crs_depth; i != 0; --i) {
         ++stats.crs_scan_iters;

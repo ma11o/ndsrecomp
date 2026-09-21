@@ -25,6 +25,7 @@
 #include "coverage_manifest.h"
 #include "live_overlay.h"
 #include "emu_profile.h"
+#include "mod_hooks.h"
 
 using armv4t::CPUState;
 using armv4t::Interpreter;
@@ -369,6 +370,12 @@ void tier3_run(uint32_t /*entry*/) {
         // Tier-1 takeover: a static bank covers this PC — hand back to the
         // dispatcher (it will call the recompiled function).
         const bool covered = nds_has_bank(pc & ~1u, thumb ? 1 : 0) != 0;
+        // Mod-hook choke point 3/3: the only place Tier 3 hands control back
+        // to native code (docs/mod-hooks.md constraint 4). sync_out(ic) above
+        // already published this iteration's SP, so it is final here exactly
+        // as the other two choke points require. A pure observer, same as
+        // the other two: it never influences `covered` or anything below.
+        nds_mod_hooks_check_return(pc);
         if (pending_entry) {
             // Resolve the transfer observation held from the previous
             // iteration against the takeover answer for its own target.

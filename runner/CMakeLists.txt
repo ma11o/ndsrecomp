@@ -66,6 +66,9 @@ set(NDS_TITLE_BANK_DIRS "" CACHE STRING
     "Semicolon list of generated title bank directories (parallel to NDS_TITLE_ROM_SHA1S)")
 set(NDS_TITLE_ROM_SHA1S "" CACHE STRING
     "Semicolon list of exact lowercase ROM SHA-1s (parallel to NDS_TITLE_BANK_DIRS)")
+set(NDS_MOD_DIR "" CACHE PATH
+    "Optional directory of mod .c/.cpp files (docs/mod-hooks.md) compiled \
+directly into the runner. Unset means zero change to the build.")
 
 # The recompiled ARM9 BIOS bank (generated; compiled as C). Generated TUs
 # trade warning-cleanliness for uniform emission — silence the expected
@@ -84,6 +87,72 @@ else()
 endif()
 list(SORT FW_BANK_BODIES)
 list(SORT FW_BANK_DISPATCH)
+
+# Mod hook tables (docs/mod-hooks.md): nds_recompile --hook-seams emits
+# <bank>_hooks.c beside a hookable bank's body/dispatch, one per bank name.
+# None of these exist unless a bank was actually regenerated with the flag,
+# so this is a pure add-if-present probe: a tree where no bank was ever
+# seamed configures and builds identically to one before this existed.
+set(HOOK_BUILTIN_BANKS arm9_bios arm7_bios freebios_arm9 freebios_arm7)
+foreach(_hb_src IN LISTS FW_BANK_DISPATCH)
+    get_filename_component(_hb_stem "${_hb_src}" NAME_WE)
+    string(REGEX REPLACE "_dispatch$" "" _hb_bank "${_hb_stem}")
+    list(APPEND HOOK_BUILTIN_BANKS "${_hb_bank}")
+endforeach()
+set(HOOK_BUILTIN_SOURCES)
+set(HOOK_BUILTIN_REGISTERED_BANKS)
+foreach(_hb_bank IN LISTS HOOK_BUILTIN_BANKS)
+    set(_hb_file "${GEN}/${_hb_bank}_hooks.c")
+    if(EXISTS "${_hb_file}")
+        list(APPEND HOOK_BUILTIN_SOURCES "${_hb_file}")
+        list(APPEND HOOK_BUILTIN_REGISTERED_BANKS "${_hb_bank}")
+    endif()
+endforeach()
+
+set(NDS_MOD_SOURCES)
+set(MOD_REGISTRY)
+if(NDS_MOD_DIR)
+    file(GLOB NDS_MOD_SOURCES CONFIGURE_DEPENDS
+        "${NDS_MOD_DIR}/*.c" "${NDS_MOD_DIR}/*.cpp")
+    list(SORT NDS_MOD_SOURCES)
+    if(NOT NDS_MOD_SOURCES)
+        message(FATAL_ERROR
+            "NDS_MOD_DIR (${NDS_MOD_DIR}) has no .c/.cpp files")
+    endif()
+    # One nds_mod_init_<stem>() per file (nds_mod.h), stem sanitized to a C
+    # identifier the same way for every OS's filename rules: anything that
+    # is not [A-Za-z0-9_] becomes '_', and a leading digit gets an
+    # underscore prefix so the symbol stays a legal identifier. Two files
+    # that sanitize to the same identifier (e.g. "a-b.c" and "a_b.cpp")
+    # would silently share one init call, so that is a configure-time error
+    # rather than "whichever the linker happened to see last".
+    set(MOD_REGISTRY "${CMAKE_CURRENT_BINARY_DIR}/nds_mod_registry.cpp")
+    file(WRITE "${MOD_REGISTRY}" "// AUTO-GENERATED. DO NOT EDIT.\n\n")
+    set(_mod_stems)
+    foreach(src IN LISTS NDS_MOD_SOURCES)
+        get_filename_component(_stem "${src}" NAME_WE)
+        string(REGEX REPLACE "[^A-Za-z0-9_]" "_" _stem "${_stem}")
+        if(_stem MATCHES "^[0-9]")
+            set(_stem "_${_stem}")
+        endif()
+        list(FIND _mod_stems "${_stem}" _idx)
+        if(NOT _idx EQUAL -1)
+            message(FATAL_ERROR
+                "NDS_MOD_DIR: two files sanitize to the same init symbol "
+                "nds_mod_init_${_stem} -- rename one (source: ${src})")
+        endif()
+        list(APPEND _mod_stems "${_stem}")
+        file(APPEND "${MOD_REGISTRY}"
+            "extern \"C\" void nds_mod_init_${_stem}(void);\n")
+    endforeach()
+    file(APPEND "${MOD_REGISTRY}" "\nvoid nds_mod_run_all_init(void) {\n")
+    foreach(_stem IN LISTS _mod_stems)
+        file(APPEND "${MOD_REGISTRY}"
+            "    nds_mod_init_${_stem}();\n")
+    endforeach()
+    file(APPEND "${MOD_REGISTRY}" "}\n")
+endif()
+
 set(SM64DS_BANK_SOURCES)
 if(NDS_SM64DS_BANK_DIR)
     file(GLOB SM64DS_BANK_SOURCES CONFIGURE_DEPENDS
@@ -120,6 +189,7 @@ endif()
 
 set(TITLE_BANK_BODIES)
 set(TITLE_BANK_DISPATCH)
+set(TITLE_BANK_HOOKS)
 set(TITLE_BANK_SOURCES)
 set(TITLE_GROUP_COUNT 0)
 list(LENGTH TITLE_GROUP_DIRS TITLE_GROUP_COUNT)
@@ -138,8 +208,14 @@ if(TITLE_GROUP_COUNT GREATER 0)
             "${_group_dir}/*_[0-9][0-9].c")
         file(GLOB _group_dispatch CONFIGURE_DEPENDS
             "${_group_dir}/*_dispatch.c")
+        # Mod hook tables for this title, same add-if-present probe as the
+        # built-in banks above. *_hooks.c never matches the two globs just
+        # above (it ends in neither two digits nor "_dispatch").
+        file(GLOB _group_hooks CONFIGURE_DEPENDS
+            "${_group_dir}/*_hooks.c")
         list(SORT _group_bodies)
         list(SORT _group_dispatch)
+        list(SORT _group_hooks)
         # Optional explicit registration priority. Runtime dispatch is
         # first-match-wins in registration order; the default order is this
         # alphabetical sort. A title may ship registration-order.txt in its
@@ -179,10 +255,13 @@ if(TITLE_GROUP_COUNT GREATER 0)
         endif()
         set(TITLE_GROUP_${_gi}_SHA1 "${_group_sha1}")
         set(TITLE_GROUP_${_gi}_DISPATCH ${_group_dispatch})
+        set(TITLE_GROUP_${_gi}_HOOKS ${_group_hooks})
         list(APPEND TITLE_BANK_BODIES ${_group_bodies})
         list(APPEND TITLE_BANK_DISPATCH ${_group_dispatch})
+        list(APPEND TITLE_BANK_HOOKS ${_group_hooks})
     endforeach()
-    set(TITLE_BANK_SOURCES ${TITLE_BANK_BODIES} ${TITLE_BANK_DISPATCH})
+    set(TITLE_BANK_SOURCES
+        ${TITLE_BANK_BODIES} ${TITLE_BANK_DISPATCH} ${TITLE_BANK_HOOKS})
 endif()
 add_library(nds_banks STATIC
     ${GEN}/arm9_bios.c
@@ -195,6 +274,7 @@ add_library(nds_banks STATIC
     ${GEN}/freebios_arm7_dispatch.c
     ${FW_BANK_BODIES}
     ${FW_BANK_DISPATCH}
+    ${HOOK_BUILTIN_SOURCES}
     ${SM64DS_BANK_SOURCES}
     ${TITLE_BANK_SOURCES})
 ndsrecomp_limit_generated_compiles(nds_banks)
@@ -211,6 +291,7 @@ set_source_files_properties(
     ${GEN}/freebios_arm7.c ${GEN}/freebios_arm7_dispatch.c
     ${FW_BANK_BODIES}
     ${FW_BANK_DISPATCH}
+    ${HOOK_BUILTIN_SOURCES}
     ${SM64DS_BANK_SOURCES}
     ${TITLE_BANK_SOURCES}
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-variable;-Wno-unused-but-set-variable")
@@ -278,6 +359,7 @@ set(TITLE_BANK_REGISTRY
 file(WRITE "${TITLE_BANK_REGISTRY}"
     "#include \"title_banks.h\"\n"
     "#include \"state.h\"\n"
+    "#include \"mod_hooks.h\"\n"
     "#include <cstring>\n\n")
 foreach(src IN LISTS TITLE_BANK_DISPATCH)
     get_filename_component(dispatch_stem "${src}" NAME_WE)
@@ -285,6 +367,13 @@ foreach(src IN LISTS TITLE_BANK_DISPATCH)
     file(APPEND "${TITLE_BANK_REGISTRY}"
         "extern \"C\" const DispatchEntry g_dispatch_${bank}[];\n"
         "extern \"C\" const unsigned g_dispatch_${bank}_len;\n")
+endforeach()
+foreach(src IN LISTS TITLE_BANK_HOOKS)
+    get_filename_component(hooks_stem "${src}" NAME_WE)
+    string(REGEX REPLACE "_hooks$" "" bank "${hooks_stem}")
+    file(APPEND "${TITLE_BANK_REGISTRY}"
+        "extern \"C\" const NdsHookTableEntry g_hooks_${bank}[];\n"
+        "extern \"C\" const unsigned g_hooks_${bank}_len;\n")
 endforeach()
 file(APPEND "${TITLE_BANK_REGISTRY}"
     "\nbool nds_register_configured_title_banks(const char* rom_sha1) {\n")
@@ -337,6 +426,65 @@ else()
 endif()
 file(APPEND "${TITLE_BANK_REGISTRY}" "}\n")
 
+# Second entry point, same SHA-1 gate, for whichever configured title banks
+# were regenerated with --hook-seams. Called separately (main.cpp, right
+# after nds_register_configured_title_banks) so a title with no seamed bank
+# at all costs nothing beyond the one strcmp -- most title groups have no
+# *_hooks.c and this function's body is just "return false".
+file(APPEND "${TITLE_BANK_REGISTRY}"
+    "\nbool nds_register_configured_title_hook_tables(const char* rom_sha1) {\n")
+if(TITLE_BANK_HOOKS)
+    file(APPEND "${TITLE_BANK_REGISTRY}"
+        "    if (!rom_sha1) return false;\n"
+        "    bool registered = false;\n")
+    math(EXPR _title_last "${TITLE_GROUP_COUNT} - 1")
+    foreach(_gi RANGE 0 ${_title_last})
+        if(TITLE_GROUP_${_gi}_HOOKS)
+            file(APPEND "${TITLE_BANK_REGISTRY}"
+                "    if (std::strcmp(rom_sha1, "
+                "\"${TITLE_GROUP_${_gi}_SHA1}\") == 0) {\n")
+            foreach(src IN LISTS TITLE_GROUP_${_gi}_HOOKS)
+                get_filename_component(hooks_stem "${src}" NAME_WE)
+                string(REGEX REPLACE "_hooks$" "" bank "${hooks_stem}")
+                file(APPEND "${TITLE_BANK_REGISTRY}"
+                    "        nds_mod_hooks_register_table(\"${bank}\", "
+                    "g_hooks_${bank}, g_hooks_${bank}_len);\n")
+            endforeach()
+            file(APPEND "${TITLE_BANK_REGISTRY}"
+                "        registered = true;\n"
+                "    }\n")
+        endif()
+    endforeach()
+    file(APPEND "${TITLE_BANK_REGISTRY}" "    return registered;\n")
+else()
+    file(APPEND "${TITLE_BANK_REGISTRY}"
+        "    (void)rom_sha1;\n"
+        "    return false;\n")
+endif()
+file(APPEND "${TITLE_BANK_REGISTRY}" "}\n")
+
+# Built-in bank hook tables (unconditional -- these banks always exist,
+# unlike a title's, so there is no ROM SHA-1 to gate on). Generated the same
+# add-if-present way: a build with no built-in bank ever regenerated with
+# --hook-seams gets a function whose body is just its extern "C" bracket.
+set(MOD_HOOK_BUILTIN_REGISTRY
+    "${CMAKE_CURRENT_BINARY_DIR}/mod_hook_builtin_registry.cpp")
+file(WRITE "${MOD_HOOK_BUILTIN_REGISTRY}"
+    "#include \"mod_hooks.h\"\n\n")
+foreach(_hb_bank IN LISTS HOOK_BUILTIN_REGISTERED_BANKS)
+    file(APPEND "${MOD_HOOK_BUILTIN_REGISTRY}"
+        "extern \"C\" const NdsHookTableEntry g_hooks_${_hb_bank}[];\n"
+        "extern \"C\" const unsigned g_hooks_${_hb_bank}_len;\n")
+endforeach()
+file(APPEND "${MOD_HOOK_BUILTIN_REGISTRY}"
+    "\nvoid nds_mod_register_builtin_hook_tables() {\n")
+foreach(_hb_bank IN LISTS HOOK_BUILTIN_REGISTERED_BANKS)
+    file(APPEND "${MOD_HOOK_BUILTIN_REGISTRY}"
+        "    nds_mod_hooks_register_table(\"${_hb_bank}\", "
+        "g_hooks_${_hb_bank}, g_hooks_${_hb_bank}_len);\n")
+endforeach()
+file(APPEND "${MOD_HOOK_BUILTIN_REGISTRY}" "}\n")
+
 # SHA-1 helper (reused from the recompiler support lib).
 add_library(nds_support STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/support/sha1.cpp)
@@ -384,6 +532,10 @@ target_include_directories(nds_armv4t PUBLIC
 
 add_executable(nds_runner
     src/runtime_arm.cpp
+    src/mod_hooks.cpp
+    "${MOD_HOOK_BUILTIN_REGISTRY}"
+    ${MOD_REGISTRY}
+    ${NDS_MOD_SOURCES}
     # Out-of-line runtime_tick / runtime_should_yield / runtime_unwinding for
     # live shards published before those became header inlines. Must stay a
     # separate TU: it defines NDS_RUNTIME_ABI_SHIMS to suppress the inlines.
@@ -627,6 +779,7 @@ target_include_directories(nds_runner PRIVATE
     $<$<BOOL:${NDS_ENABLE_COMPUTE_RENDERER}>:${CMAKE_CURRENT_SOURCE_DIR}/src/melonds_compute>
     $<$<BOOL:${NDS_ENABLE_PCAP_BACKEND}>:${CMAKE_CURRENT_SOURCE_DIR}/vendor/melonds/net>
     src
+    include                                            # nds_mod.h (public mod ABI)
     vendor/melonds                                     # vendored melonDS GPU3D + Wifi + shims (GPL-3.0-or-later)
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t   # runtime_arm.h
     ${NDS_ARM_RECOMP_INCLUDE_DIRS}                     # shared ARM core headers
@@ -683,6 +836,9 @@ elseif(EXISTS "${GEN}/fw_arm9_calibration_save_dispatch.c")
     # boot.  Interaction-specific captures are optional and are registered
     # only when the complete extended set has been generated locally.
     target_compile_definitions(nds_runner PRIVATE NDS_HAVE_FW_EXTENDED_BANKS=1)
+endif()
+if(NDS_MOD_SOURCES)
+    target_compile_definitions(nds_runner PRIVATE NDS_HAVE_MODS=1)
 endif()
 if(SM64DS_BANK_SOURCES)
     target_compile_definitions(nds_runner PRIVATE NDS_HAVE_SM64DS_BANKS=1)
@@ -839,6 +995,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/scheduler.cpp
       src/spu.cpp
       src/runtime_arm.cpp
+      src/mod_hooks.cpp
       src/dispatch_timing.cpp
       src/emu_profile.cpp
       # scheduler_run_round() samples both cores' parked PCs into the always-on
@@ -846,6 +1003,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/pc_profile.cpp)
   target_include_directories(savestate_test PRIVATE
       src
+      include
       vendor/melonds
       ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t
       ${NDS_ARM_RECOMP_INCLUDE_DIRS}
@@ -868,11 +1026,13 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/scheduler.cpp
       src/spu.cpp
       src/runtime_arm.cpp
+      src/mod_hooks.cpp
       src/dispatch_timing.cpp
       src/emu_profile.cpp
       src/pc_profile.cpp)
   target_include_directories(mem_timing_test PRIVATE
       src
+      include
       vendor/melonds
       ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t
       ${NDS_ARM_RECOMP_INCLUDE_DIRS}
@@ -1038,11 +1198,13 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/scheduler.cpp
       src/spu.cpp
       src/runtime_arm.cpp
+      src/mod_hooks.cpp
       src/dispatch_timing.cpp
       src/emu_profile.cpp
       src/pc_profile.cpp)
   target_include_directories(code_cycles_fold_test PRIVATE
       src
+      include
       vendor/melonds
       ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t
       ${NDS_ARM_RECOMP_INCLUDE_DIRS}
@@ -1050,6 +1212,36 @@ ndsrecomp_link_tomlpp(frontend_config_test)
   ndsrecomp_link_tomlpp(code_cycles_fold_test)
   target_link_libraries(code_cycles_fold_test PRIVATE nds_armv4t nds_support)
   add_test(NAME code_cycles_fold_test COMMAND code_cycles_fold_test)
+
+  # docs/mod-hooks.md "Acceptance 2". Same link recipe as
+  # code_cycles_fold_test (the real runtime_call_should_return/
+  # runtime_dispatch_impl/CRS, device calls stubbed): runtime_hook_enter and
+  # nds_mod_hooks_check_return are driven directly with a fake CPU state
+  # rather than through a generated bank's wrapper -- see the file header
+  # for why that is equivalent here.
+  add_executable(mod_hooks_test
+      tests/mod_hooks_test.cpp
+      tests/savestate_test_stubs.cpp
+      src/savestate.cpp
+      src/bus.cpp
+      src/cp15.cpp
+      src/scheduler.cpp
+      src/spu.cpp
+      src/runtime_arm.cpp
+      src/mod_hooks.cpp
+      src/dispatch_timing.cpp
+      src/emu_profile.cpp
+      src/pc_profile.cpp)
+  target_include_directories(mod_hooks_test PRIVATE
+      src
+      include
+      vendor/melonds
+      ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t
+      ${NDS_ARM_RECOMP_INCLUDE_DIRS}
+      ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/support)
+  ndsrecomp_link_tomlpp(mod_hooks_test)
+  target_link_libraries(mod_hooks_test PRIVATE nds_armv4t nds_support)
+  add_test(NAME mod_hooks_test COMMAND mod_hooks_test)
 
   add_executable(gpu2d_window_test
       tests/gpu2d_window_test.cpp
