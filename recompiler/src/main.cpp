@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "analysis_metadata.h"
 #include "codegen_identity.h"
 #include "config.h"
 #include "function_finder.h"
@@ -1255,6 +1256,7 @@ int main(int argc, char** argv) {
     bool prune_preceding_owned = false;
     bool dispatch_only = false;
     bool stable_address_shards = false;
+    bool analysis_json = false;
     unsigned shards = 1u;
     uint32_t max_function_bytes = 0u;
     bool msr_fast_path = true;
@@ -1293,6 +1295,7 @@ int main(int argc, char** argv) {
             prune_preceding_owned = true;
         else if (a == "--dispatch-only") dispatch_only = true;
         else if (a == "--stable-address-shards") stable_address_shards = true;
+        else if (a == "--analysis-json") analysis_json = true;
         else if (a == "--shards") shards = static_cast<unsigned>(
             std::strtoul(next(), nullptr, 0));
         else if (a == "--max-function-bytes") max_function_bytes =
@@ -1694,6 +1697,21 @@ int main(int argc, char** argv) {
                             cfg.program.load_address, names,
                             validate_live_bytes, validated_live_direct_calls,
                             superblocks, hle_routines, pruned_keys);
+        // Observational sidecar for analysis tooling; never read back by
+        // codegen or the runtime (see analysis_metadata.h).
+        if (analysis_json) {
+            AnalysisBankInfo info;
+            info.bank = names.bank;
+            info.fn_prefix = names.fn_prefix;
+            info.program_id = cfg.program.id;
+            info.program_name = cfg.program.name;
+            info.image_sha1 = cfg.identity.sha1;
+            info.load_address = cfg.program.load_address;
+            info.image_size = static_cast<uint32_t>(bin.size());
+            if (!write_bank_analysis(out_dir, info, funcs, bin.data(),
+                                     bin.size(), cfg.program.load_address))
+                return 1;
+        }
         std::printf("\n[emit] bank '%s': %zu functions (%u body shard%s%s) -> %s/{%s,%s,%s}\n",
                     bank.c_str(), funcs.size(), emitted_shards,
                     emitted_shards == 1u ? "" : "s",

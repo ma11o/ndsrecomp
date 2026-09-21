@@ -42,6 +42,7 @@ add_test(NAME hle_manifest_test COMMAND hle_manifest_test)
 # The recompiler driver: config + function finder + audit/emit.
 add_executable(nds_recompile
     src/main.cpp
+    src/analysis_metadata.cpp
     finder/config.cpp
     finder/function_finder.cpp
     finder/reloc_scan.cpp
@@ -95,6 +96,15 @@ if(Python3_Interpreter_FOUND)
               --runtime-include
                   "${CMAKE_CURRENT_LIST_DIR}/../external/arm-recomp-core/common"
               --work "${CMAKE_CURRENT_BINARY_DIR}/shard-identity-work")
+  # --analysis-json is observational: it must not move generated C, and the
+  # sidecar must recover facts that are ground truth in the FreeBIOS source.
+  add_test(
+      NAME analysis_metadata_test
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_LIST_DIR}/tests/analysis_metadata_test.py"
+              --recompiler $<TARGET_FILE:nds_recompile>
+              --repo "${CMAKE_CURRENT_LIST_DIR}/.."
+              --work "${CMAKE_CURRENT_BINARY_DIR}/analysis-metadata-work")
 endif()
 
 add_executable(live_transfer_validation_test
