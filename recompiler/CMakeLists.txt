@@ -105,6 +105,12 @@ if(Python3_Interpreter_FOUND)
               --recompiler $<TARGET_FILE:nds_recompile>
               --repo "${CMAKE_CURRENT_LIST_DIR}/.."
               --work "${CMAKE_CURRENT_BINARY_DIR}/analysis-metadata-work")
+  # tools/analysis_index.py merges several bank sidecars and resolves
+  # cross-bank edges; it only needs synthetic fixtures, not a real image.
+  add_test(
+      NAME analysis_index_test
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_LIST_DIR}/../tools/tests/analysis_index_test.py")
 endif()
 
 add_executable(live_transfer_validation_test
