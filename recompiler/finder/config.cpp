@@ -539,6 +539,101 @@ bool load_hle_profile_manifest(const std::string& path,
     return true;
 }
 
+bool load_hook_manifest(const std::string& path, HookManifest& out) {
+    out = HookManifest{};
+    out.source_path = path;
+
+    toml::table tbl;
+    try {
+        tbl = toml::parse_file(path);
+    } catch (const toml::parse_error& e) {
+        std::fprintf(stderr, "%shook manifest parse error in %s: %s\n",
+                     kAbortHeader, path.c_str(), e.what());
+        return false;
+    }
+
+    // Same discipline as the HLE manifest above: exactly these three
+    // top-level keys, so a misspelling fails closed instead of silently
+    // selecting nothing.
+    const auto version = tbl["version"].value<int64_t>();
+    const auto* program = tbl["program"].as_table();
+    const auto* hooks = tbl["hook"].as_array();
+    if (!version || !program || !hooks || tbl.size() != 3u) {
+        std::fprintf(stderr,
+            "%shook manifest requires exactly version, [program], and "
+            "[[hook]] keys\n", kAbortHeader);
+        return false;
+    }
+    if (*version != 1) {
+        std::fprintf(stderr,
+            "%shook manifest version must be 1 (got %lld)\n",
+            kAbortHeader, static_cast<long long>(*version));
+        return false;
+    }
+    out.version = 1u;
+
+    bool ok = true;
+    std::string err;
+    out.bank = get_string_field(*program, "bank", true, ok, err);
+    out.program_sha1 = hex_lower(
+        get_string_field(*program, "sha1", true, ok, err));
+    if (!ok || program->size() != 2u || !safe_profile_bank(out.bank) ||
+        out.program_sha1.size() != 40u ||
+        !std::all_of(out.program_sha1.begin(), out.program_sha1.end(),
+                     [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+        std::fprintf(stderr,
+            "%shook [program] requires only non-empty bank and a 40-digit "
+            "SHA-1\n", kAbortHeader);
+        return false;
+    }
+
+    if (hooks->empty()) {
+        std::fprintf(stderr,
+            "%shook manifest must select at least one hook\n", kAbortHeader);
+        return false;
+    }
+    std::unordered_set<std::string> selectors;
+    for (std::size_t index = 0; index < hooks->size(); ++index) {
+        const auto* table = (*hooks)[index].as_table();
+        if (!table || table->size() != 2u) {
+            std::fprintf(stderr,
+                "%shook [[hook]] %zu requires exactly address and mode\n",
+                kAbortHeader, index);
+            return false;
+        }
+        HookManifestEntry entry;
+        ok = true;
+        err.clear();
+        entry.address = get_manifest_u32(*table, "address", ok);
+        const std::string mode = get_string_field(
+            *table, "mode", true, ok, err);
+        if (!ok || !parse_mode(mode, entry.mode)) {
+            std::fprintf(stderr,
+                "%shook [[hook]] %zu has an invalid required field%s%s\n",
+                kAbortHeader, index, err.empty() ? "" : ": ", err.c_str());
+            return false;
+        }
+        const uint32_t alignment = entry.mode == CpuMode::Thumb ? 2u : 4u;
+        if ((entry.address % alignment) != 0u) {
+            std::fprintf(stderr,
+                "%shook [[hook]] %zu address 0x%08X is not %s-aligned\n",
+                kAbortHeader, index, entry.address,
+                entry.mode == CpuMode::Thumb ? "halfword" : "word");
+            return false;
+        }
+        const std::string selector =
+            std::to_string(entry.address) + ":" + mode;
+        if (!selectors.insert(selector).second) {
+            std::fprintf(stderr,
+                "%shook [[hook]] %zu duplicates an address/mode selector\n",
+                kAbortHeader, index);
+            return false;
+        }
+        out.hooks.push_back(entry);
+    }
+    return true;
+}
+
 bool load_config(const std::string& path, Config& out) {
     out = Config{};
     out.source_path = path;

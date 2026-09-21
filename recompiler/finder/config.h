@@ -121,6 +121,26 @@ struct HleProfileManifest {
     std::vector<HleProfileRoutine> routines;
 };
 
+// A title-owned manifest selecting which functions in one bank get a mod
+// hook seam under `--hook-seams manifest`. Deliberately narrower than the
+// HLE manifest above: a hook target is identified by address + mode alone
+// (the wrapper's own entry-PC check is what makes the seam exact), with no
+// end address or content hash -- there is no differential contract to key by
+// content here, only "this exact (bank, addr) is the seam identity a mod
+// registers against".
+struct HookManifestEntry {
+    uint32_t address = 0;
+    CpuMode  mode = CpuMode::Arm;
+};
+
+struct HookManifest {
+    std::string source_path;
+    uint32_t    version = 0;
+    std::string bank;
+    std::string program_sha1;
+    std::vector<HookManifestEntry> hooks;
+};
+
 // Load a TOML config from `path`. On success returns true and
 // populates `out`. On parse/structural error returns false and
 // writes a human-readable diagnostic to stderr.
@@ -134,6 +154,14 @@ bool load_config(const std::string& path, Config& out);
 // silently instrument a different guest routine.
 bool load_hle_profile_manifest(const std::string& path,
                                HleProfileManifest& out);
+
+// Load the strict mod-hook seam manifest for `--hook-seams manifest`.
+// Unknown keys and duplicate (address, mode) selectors fail closed for the
+// same reason the HLE manifest does: a stale or misspelled selector must not
+// silently seam a different guest routine. Whether each address actually
+// resolves to a discovered function in the target bank is checked later,
+// against the finder's output, not here.
+bool load_hook_manifest(const std::string& path, HookManifest& out);
 
 // Verify the config's identity hashes against the binary bytes.
 // Returns true on match; false and prints a diagnostic on

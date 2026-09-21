@@ -174,6 +174,51 @@ NdsHleProfileToken runtime_hle_profile_begin(
 void runtime_hle_profile_end(const NdsHleProfileDescriptor* descriptor,
                              NdsHleProfileToken token);
 
+// Mod hook seam. nds_recompile --hook-seams emits one of these per hookable
+// function alongside a public wrapper that guards the original body: the
+// wrapper checks `armed` before anything else (an un-hooked call costs one
+// load and a predictable branch, right next to the per-instruction yield
+// check the body already pays), then confirms it is the function's real
+// entry rather than an interior resume, then hands control to
+// runtime_hook_enter. Everything past `armed` -- registration, the enter/
+// leave handlers, the return watch -- is owned by the runner's mod-hook
+// subsystem, not by generated code.
+//
+// `armed` is plain uint32_t, not volatile: every mod registers via
+// nds_hook_enter/nds_hook_leave (runner/src/mod_hooks.cpp) from its
+// nds_mod_init_<stem>() entry point, which the generated mod registry calls
+// once at startup, before the scheduler runs any guest code -- the same
+// single-writer-before-first-read convention nds_register_dispatch already
+// relies on. The wrapper's own read happens only on the emulation thread,
+// strictly after that registration completed on the same thread, so there
+// is neither a concurrent writer nor a cross-thread visibility requirement
+// for `volatile` to express; it would only block the compiler from treating
+// repeated same-iteration reads as loop-invariant for no correctness benefit.
+typedef struct NdsHookSlot {
+    uint32_t armed;
+    const char* bank;
+    uint32_t addr;
+    uint8_t thumb;
+    void* enter_fn;
+    void* leave_fn;
+    void* user_data;
+} NdsHookSlot;
+
+// One row of a bank's `<bank>_hooks.c` table: sorted by (addr, thumb) so a
+// mod can binary-search it by the same (bank, addr) identity the analysis
+// index and the dispatch tables already use.
+typedef struct NdsHookTableEntry {
+    uint32_t addr;
+    uint8_t thumb;
+    NdsHookSlot* slot;
+} NdsHookTableEntry;
+
+// Implemented by the runner's mod-hook subsystem. Called only after the
+// wrapper's own `armed` and entry-PC checks both pass. A nonzero return means
+// a mod's enter handler completed the call itself (HANDLED); the wrapper
+// must not run the retained body in that case.
+int runtime_hook_enter(NdsHookSlot* slot);
+
 // Convenience accessors for the shared CPSR-bit constants.
 static inline uint32_t cpsr_n(void) { return (g_cpu.cpsr & CPSR_N_BIT) ? 1u : 0u; }
 static inline uint32_t cpsr_z(void) { return (g_cpu.cpsr & CPSR_Z_BIT) ? 1u : 0u; }

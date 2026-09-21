@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(nds_recompile VERSION 0.6.10 LANGUAGES CXX)
+# C is enabled so the test suite can syntax-check the C this recompiler
+# emits (generated banks are plain C over runtime_arm.h) against a real C
+# compiler, the same way runner/CMakeLists.txt does for the runner build.
+project(nds_recompile VERSION 0.6.10 LANGUAGES C CXX)
 
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/NdsCompilerCache.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/NdsJobPools.cmake")
@@ -39,6 +42,15 @@ target_include_directories(hle_manifest_test PRIVATE
 ndsrecomp_link_tomlpp(hle_manifest_test)
 add_test(NAME hle_manifest_test COMMAND hle_manifest_test)
 
+add_executable(hook_manifest_test
+    tests/hook_manifest_test.cpp
+    finder/config.cpp
+    support/sha1.cpp)
+target_include_directories(hook_manifest_test PRIVATE
+    finder support ${NDS_ARM_RECOMP_INCLUDE_DIRS})
+ndsrecomp_link_tomlpp(hook_manifest_test)
+add_test(NAME hook_manifest_test COMMAND hook_manifest_test)
+
 # The recompiler driver: config + function finder + audit/emit.
 add_executable(nds_recompile
     src/main.cpp
@@ -77,6 +89,21 @@ add_test(NAME codegen_golden
             $<TARGET_FILE:nds_recompile>
             ${CMAKE_CURRENT_BINARY_DIR}/codegen_golden_work
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/codegen_golden.txt)
+
+# --hook-seams has no runner side yet (that is a separate follow-up), so the
+# only oracle here is: does the emitted C have the documented wrapper shape
+# and does it actually compile against the real generated-code ABI header.
+add_executable(hook_seams_codegen_test
+    tests/hook_seams_codegen_test.cpp
+    support/sha1.cpp)
+target_include_directories(hook_seams_codegen_test PRIVATE support)
+add_test(NAME hook_seams_codegen
+    COMMAND hook_seams_codegen_test
+            $<TARGET_FILE:nds_recompile>
+            ${CMAKE_CURRENT_BINARY_DIR}/hook_seams_codegen_work
+            "${CMAKE_C_COMPILER}"
+            "${CMAKE_CURRENT_LIST_DIR}/armv4t"
+            "${CMAKE_CURRENT_LIST_DIR}/../external/arm-recomp-core/common")
 
 # The other half of beads-yjp.52: the shard provider identity may only move
 # when compiled output can. Registered here rather than under runner/ because

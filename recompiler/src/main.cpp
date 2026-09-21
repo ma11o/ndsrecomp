@@ -470,6 +470,71 @@ const ResolvedHleRoutine* find_hle_routine(
     return nullptr;
 }
 
+// ── Mod hook seams ───────────────────────────────────────────────────────
+//
+// `--hook-seams manifest` resolves each `[[hook]]` address+mode against the
+// functions this run is actually about to emit -- the same set the dispatch
+// table and direct calls target -- so a stale or misspelled selector fails
+// the build instead of silently seaming nothing. `--hook-seams all` skips
+// this resolution: every emitted function is hookable, keyed the same way.
+bool resolve_hook_manifest(const HookManifest& manifest, const Config& cfg,
+                           const std::string& bank,
+                           const std::vector<Function>& funcs,
+                           std::unordered_set<uint64_t>& hook_keys) {
+    if (manifest.bank != bank) {
+        std::fprintf(stderr,
+            "[emit] hook manifest bank '%s' does not match --bank '%s'\n",
+            manifest.bank.c_str(), bank.c_str());
+        return false;
+    }
+    std::string program_sha1 = cfg.identity.sha1;
+    std::transform(program_sha1.begin(), program_sha1.end(),
+                   program_sha1.begin(), [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    if (program_sha1.rfind("0x", 0u) == 0u) program_sha1.erase(0u, 2u);
+    if (manifest.program_sha1 != program_sha1) {
+        std::fprintf(stderr,
+            "[emit] hook manifest program SHA-1 does not match verified "
+            "input\n");
+        return false;
+    }
+    for (const HookManifestEntry& entry : manifest.hooks) {
+        const Function* found = nullptr;
+        unsigned matches = 0u;
+        for (const Function& fn : funcs) {
+            if (fn.addr == entry.address && fn.mode == entry.mode) {
+                found = &fn;
+                ++matches;
+            }
+        }
+        if (matches == 0u) {
+            std::fprintf(stderr,
+                "[emit] hook manifest address 0x%08X (%s) is not an "
+                "emitted function in bank '%s'\n", entry.address,
+                entry.mode == CpuMode::Thumb ? "thumb" : "arm", bank.c_str());
+            return false;
+        }
+        if (matches > 1u) {
+            std::fprintf(stderr,
+                "[emit] hook manifest address 0x%08X (%s) resolves "
+                "ambiguously\n", entry.address,
+                entry.mode == CpuMode::Thumb ? "thumb" : "arm");
+            return false;
+        }
+        hook_keys.insert(function_key(found->addr, found->mode));
+    }
+    return true;
+}
+
+// A function's slot symbol, stable across shards: `<bank>_hooks.c` defines
+// it once and each shard that emits the function's wrapper declares it
+// `extern`. Derived from the same public symbol name the dispatch table and
+// direct calls already use, so it can't collide within a bank.
+std::string hook_slot_symbol(const BankNames& names, const Function& fn) {
+    return "g_hook_" + names.fn_prefix + fn.name;
+}
+
 // ── Tiny-leaf inlining pass (beads-yjp.67) ───────────────────────────────
 //
 // A "tiny leaf" is a guest function that is entirely a straight-line
@@ -548,6 +613,7 @@ std::unordered_map<uint64_t, armv4t::InlineLeaf> build_inline_leaves(
         const uint8_t* rom, std::size_t rom_size, uint32_t rom_base,
         const BankNames& names, unsigned max_insns,
         const std::vector<ResolvedHleRoutine>& hle_routines,
+        const std::unordered_set<uint64_t>& hook_keys,
         const std::unordered_set<uint64_t>& pruned_keys,
         unsigned* leaf_count) {
     std::unordered_map<uint64_t, armv4t::InlineLeaf> leaves;
@@ -612,8 +678,18 @@ std::unordered_map<uint64_t, armv4t::InlineLeaf> build_inline_leaves(
         if (!ok) continue;
 
         const std::size_t leader = superblocks.leader[index];
+        // A hookable function is never inlined as a callee: its public
+        // symbol is where the seam lives (constraint: leaf inlining and
+        // fall-through coalescing both bypass that symbol), and an inlined
+        // copy at the call site would make it invisible to a mod that arms
+        // the slot. Fall-through coalescing needs no matching check here --
+        // it requires --validate-live-bytes, which --hook-seams already
+        // rejects, so a hookable function is always its own leader.
         if (find_hle_routine(hle_routines, funcs[leader]) ||
-            find_hle_routine(hle_routines, fn)) {
+            find_hle_routine(hle_routines, fn) ||
+            hook_keys.count(function_key(funcs[leader].addr,
+                                         funcs[leader].mode)) != 0u ||
+            hook_keys.count(function_key(fn.addr, fn.mode)) != 0u) {
             continue;
         }
         leaf.owner_symbol = names.fn_prefix + funcs[leader].name;
@@ -886,7 +962,8 @@ void emit_function_body(std::FILE* f, const Function& fn,
 
 void write_bank_header(const std::string& dir,
                        const std::vector<Function>& funcs,
-                       const BankNames& names) {
+                       const BankNames& names,
+                       bool hook_seams_active) {
     std::FILE* f = std::fopen((dir + "/" + names.header).c_str(), "wb");
     if (!f) { std::fprintf(stderr, "cannot write %s\n", names.header.c_str()); return; }
     std::fprintf(f,
@@ -898,6 +975,14 @@ void write_bank_header(const std::string& dir,
         std::fprintf(f, "void %s%s(void);  /* 0x%08X %s */\n",
                      names.fn_prefix.c_str(), fn.name.c_str(), fn.addr,
                      fn.mode == CpuMode::Thumb ? "thumb" : "arm");
+    // The hook table lives in <bank>_hooks.c; declared here so a mod (or the
+    // runner's title-bank registry) can find it via the bank header the same
+    // way it finds the dispatch table, without parsing generated file names.
+    if (hook_seams_active)
+        std::fprintf(f,
+            "\nextern const NdsHookTableEntry g_hooks_%s[];\n"
+            "extern const unsigned g_hooks_%s_len;\n",
+            names.bank.c_str(), names.bank.c_str());
     std::fprintf(f, "\n#endif /* %s */\n", names.guard.c_str());
     std::fclose(f);
 }
@@ -1119,6 +1204,61 @@ void write_bank_dispatch(const std::string& dir,
     std::fclose(f);
 }
 
+// Emitted once per bank when --hook-seams is active: every hookable
+// function's slot, defined exactly once here so a multi-shard bank still has
+// one definition, plus the sorted {addr, thumb, &slot} table a mod uses to
+// find a slot by (bank, addr) at startup without the generated header. Body
+// shards that emit a hookable function's wrapper declare its slot `extern`
+// (write_bank_body) rather than redefining it.
+void write_bank_hooks(const std::string& dir,
+                      const std::vector<Function>& funcs,
+                      const BankNames& names,
+                      const std::unordered_set<uint64_t>& hook_keys,
+                      unsigned* hook_count) {
+    std::FILE* f = std::fopen((dir + "/" + names.bank + "_hooks.c").c_str(),
+                              "wb");
+    if (!f) {
+        std::fprintf(stderr, "cannot write %s_hooks.c\n", names.bank.c_str());
+        return;
+    }
+    std::fprintf(f,
+        "/* AUTO-GENERATED by nds_recompile. DO NOT EDIT.\n"
+        "   Mod hook slots for bank '%s': one NdsHookSlot per hookable\n"
+        "   function plus a sorted {addr, thumb, &slot} table. Slots start\n"
+        "   unarmed (every field zero); the runner's mod-hook subsystem\n"
+        "   arms one when a mod registers against its (bank, addr). */\n"
+        "#include \"runtime_arm.h\"\n\n",
+        names.bank.c_str());
+
+    struct Row { uint32_t addr; uint8_t thumb; std::string symbol; };
+    std::vector<Row> rows;
+    rows.reserve(hook_keys.size());
+    for (const Function& fn : funcs) {
+        if (hook_keys.count(function_key(fn.addr, fn.mode)) == 0u) continue;
+        rows.push_back({fn.addr, fn.mode == CpuMode::Thumb ? uint8_t{1}
+                                                            : uint8_t{0},
+                        hook_slot_symbol(names, fn)});
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+        if (a.addr != b.addr) return a.addr < b.addr;
+        return a.thumb < b.thumb;
+    });
+    for (const Row& row : rows)
+        std::fprintf(f,
+            "NdsHookSlot %s = {0u, \"%s\", 0x%08Xu, %uu, 0, 0, 0};\n",
+            row.symbol.c_str(), names.bank.c_str(), row.addr,
+            unsigned(row.thumb));
+    std::fprintf(f, "\nconst NdsHookTableEntry g_hooks_%s[] = {\n",
+                 names.bank.c_str());
+    for (const Row& row : rows)
+        std::fprintf(f, "    {0x%08Xu, %uu, &%s},\n", row.addr,
+                     unsigned(row.thumb), row.symbol.c_str());
+    std::fprintf(f, "};\nconst unsigned g_hooks_%s_len = %zuu;\n",
+                 names.bank.c_str(), rows.size());
+    std::fclose(f);
+    if (hook_count) *hook_count = static_cast<unsigned>(rows.size());
+}
+
 void write_bank_body(const std::string& dir,
                      const std::vector<Function>& funcs,
                      const uint8_t* rom, std::size_t rom_size,
@@ -1129,6 +1269,7 @@ void write_bank_body(const std::string& dir,
                      bool trace_live_transfers,
                      const SuperblockPlan& superblocks,
                      const std::vector<ResolvedHleRoutine>& hle_routines,
+                     const std::unordered_set<uint64_t>& hook_keys,
                      bool msr_fast_path,
                      const std::unordered_map<uint64_t, armv4t::InlineLeaf>&
                          inline_leaves,
@@ -1188,6 +1329,15 @@ void write_bank_body(const std::string& dir,
         const std::size_t block_end = superblocks.end[index];
         const bool coalesced = block_end > index + 1u;
         const ResolvedHleRoutine* hle = find_hle_routine(hle_routines, fn);
+        // Mutually exclusive with `hle` (--hook-seams rejects --hle-manifest)
+        // and never coalesced (--hook-seams rejects --validate-live-bytes,
+        // which --coalesce-fallthroughs requires), so `index == leader` and
+        // `block_end == index + 1` always hold here.
+        const bool hookable = !hle &&
+            hook_keys.count(function_key(fn.addr, fn.mode)) != 0u;
+        const std::string public_name = names.fn_prefix + fn.name;
+        const std::string body_name = hookable ? public_name + "__lle"
+                                                : public_name;
         if (hle) {
             std::fprintf(f,
                 "#ifdef NDS_PROFILE_HLE_HEAT\n"
@@ -1201,17 +1351,21 @@ void write_bank_body(const std::string& dir,
                 hle->descriptor_symbol.c_str(), names.fn_prefix.c_str(),
                 fn.name.c_str(), names.fn_prefix.c_str(), fn.name.c_str());
         }
+        if (hookable)
+            std::fprintf(f, "extern NdsHookSlot %s;\n",
+                         hook_slot_symbol(names, fn).c_str());
         std::fprintf(f,
-            "/* 0x%08X  mode=%s  end=0x%08X  branches=%zu%s%s */\n"
+            "/* 0x%08X  mode=%s  end=0x%08X  branches=%zu%s%s%s */\n"
             "%svoid %s(void) {\n",
             fn.addr, fn.mode == CpuMode::Thumb ? "thumb" : "arm",
             funcs[block_end - 1u].end_addr,
             fn.direct_branch_targets.size(),
             fn.has_indirect_transfer ? "  indirect" : "",
             coalesced ? "  coalesced" : "",
-            hle ? "NDS_HLE_BODY_STORAGE " : "",
-            hle ? "NDS_HLE_BODY_NAME" :
-                  (names.fn_prefix + fn.name).c_str());
+            hookable ? "  hookable" : "",
+            hookable ? "static " : (hle ? "NDS_HLE_BODY_STORAGE " : ""),
+            hookable ? body_name.c_str() :
+                (hle ? "NDS_HLE_BODY_NAME" : public_name.c_str()));
         if (coalesced)
             emit_resume_switch(f, funcs, index, block_end);
         for (std::size_t member = index; member < block_end; ++member) {
@@ -1238,6 +1392,25 @@ void write_bank_body(const std::string& dir,
                 hle->descriptor_symbol.c_str(), names.fn_prefix.c_str(),
                 fn.name.c_str(), hle->descriptor_symbol.c_str());
         }
+        if (hookable) {
+            const std::string slot = hook_slot_symbol(names, fn);
+            // `armed` gates everything: an unarmed slot costs one load and a
+            // predictable branch, right next to the per-instruction yield
+            // check the body already pays. The entry-PC check keeps an
+            // interior resume (the scheduler re-entering this C function at
+            // an L_<pc> label after a yield) out of the seam entirely -- only
+            // a real call through the public symbol can land at fn.addr.
+            std::fprintf(f,
+                "void %s(void) {\n"
+                "    if (%s.armed &&\n"
+                "        g_cpu.R[15] == 0x%08Xu &&\n"
+                "        runtime_hook_enter(&%s))\n"
+                "        return;\n"
+                "    %s();\n"
+                "}\n\n",
+                public_name.c_str(), slot.c_str(), fn.addr, slot.c_str(),
+                body_name.c_str());
+        }
     }
     std::fclose(f);
 }
@@ -1246,6 +1419,7 @@ void write_bank_body(const std::string& dir,
 
 int main(int argc, char** argv) {
     std::string config_path, bin_path, out_dir, bank, hle_manifest_path;
+    std::string hook_seams_mode, hook_manifest_path;
     std::vector<std::string> preceding_dispatch_paths;
     bool audit = false;
     bool validate_live_bytes = false;
@@ -1279,6 +1453,8 @@ int main(int argc, char** argv) {
         else if (a == "--out") out_dir = next();
         else if (a == "--bank") bank = next();
         else if (a == "--hle-manifest") hle_manifest_path = next();
+        else if (a == "--hook-seams") hook_seams_mode = next();
+        else if (a == "--hook-manifest") hook_manifest_path = next();
         else if (a == "--preceding-dispatch")
             preceding_dispatch_paths.push_back(next());
         else if (a == "--audit") audit = true;
@@ -1339,6 +1515,53 @@ int main(int argc, char** argv) {
             "--validated-live-direct-calls requires --validate-live-bytes\n");
         return 2;
     }
+    if (!hook_seams_mode.empty() &&
+        hook_seams_mode != "all" && hook_seams_mode != "manifest") {
+        std::fprintf(stderr,
+            "--hook-seams must be 'all' or 'manifest' (got '%s')\n",
+            hook_seams_mode.c_str());
+        return 2;
+    }
+    if (hook_seams_mode == "manifest" && hook_manifest_path.empty()) {
+        std::fprintf(stderr,
+            "--hook-seams manifest requires --hook-manifest <toml>\n");
+        return 2;
+    }
+    if (hook_seams_mode == "manifest" && bank.empty()) {
+        // The manifest declares the bank it targets and that has to be
+        // checked against something concrete before any address in it is
+        // resolved; the same requirement --hle-manifest already has, for the
+        // same reason (main() only defaults --bank from the binary's
+        // filename stem later, inside the emission path).
+        std::fprintf(stderr,
+            "--hook-seams manifest requires an explicit --bank\n");
+        return 2;
+    }
+    if (hook_seams_mode == "all" && !hook_manifest_path.empty()) {
+        std::fprintf(stderr,
+            "--hook-manifest is only used with --hook-seams manifest\n");
+        return 2;
+    }
+    if (!hook_seams_mode.empty() &&
+        (audit || validate_live_bytes || !hle_manifest_path.empty())) {
+        // Both rejections are about what a wrapper would have to reconcile,
+        // not a fundamental incompatibility -- left for a later version (see
+        // docs/mod-hooks.md "Limits of the first version"):
+        //   --validate-live-bytes: a content-validated bank can hold more
+        //     than one generation at the same address, so "the seam" would
+        //     need to be per generation, not per bank; --coalesce-
+        //     fallthroughs (which requires --validate-live-bytes) also
+        //     merges a hookable function's own body into its caller's,
+        //     which would delete the public symbol the seam is anchored to.
+        //   --hle-manifest: an HLE wrapper and a hook wrapper both want the
+        //     public symbol and both retarget the private body's name; two
+        //     independent wrapper generators racing for the same symbol is
+        //     not a state worth emitting.
+        std::fprintf(stderr,
+            "--hook-seams requires emission and rejects --audit, "
+            "--validate-live-bytes, and --hle-manifest\n");
+        return 2;
+    }
 
     HleProfileManifest hle_manifest;
     if (!hle_manifest_path.empty()) {
@@ -1349,6 +1572,12 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (!load_hle_profile_manifest(hle_manifest_path, hle_manifest))
+            return 1;
+    }
+
+    HookManifest hook_manifest;
+    if (hook_seams_mode == "manifest") {
+        if (!load_hook_manifest(hook_manifest_path, hook_manifest))
             return 1;
     }
 
@@ -1570,6 +1799,15 @@ int main(int argc, char** argv) {
                                   finder.functions(), funcs, bin.data(),
                                   bin.size(), hle_routines))
             return 1;
+        std::unordered_set<uint64_t> hook_keys;
+        if (hook_seams_mode == "all") {
+            for (const Function& fn : funcs)
+                hook_keys.insert(function_key(fn.addr, fn.mode));
+        } else if (hook_seams_mode == "manifest") {
+            if (!resolve_hook_manifest(hook_manifest, cfg, bank, funcs,
+                                       hook_keys))
+                return 1;
+        }
         auto emission_addr = [](const Function& fn) {
             return fn.source_addr ? fn.source_addr : fn.addr;
         };
@@ -1615,9 +1853,9 @@ int main(int argc, char** argv) {
             build_inline_leaves(funcs, superblocks, bin.data(), bin.size(),
                                 cfg.program.load_address, names,
                                 inline_leaf_max_insns, hle_routines,
-                                pruned_keys, &inline_leaf_count);
+                                hook_keys, pruned_keys, &inline_leaf_count);
         if (!dispatch_only) {
-            write_bank_header(out_dir, funcs, names);
+            write_bank_header(out_dir, funcs, names, !hook_seams_mode.empty());
             if (shards == 0u) shards = 1u;
             auto emit_shard = [&](unsigned shard, std::size_t first,
                                   std::size_t last) {
@@ -1637,6 +1875,7 @@ int main(int argc, char** argv) {
                                 validate_live_bytes,
                                 superblocks,
                                 hle_routines,
+                                hook_keys,
                                 msr_fast_path,
                                 inline_leaves,
                                 &inline_leaf_sites);
@@ -1694,6 +1933,9 @@ int main(int argc, char** argv) {
                             cfg.program.load_address, names,
                             validate_live_bytes, validated_live_direct_calls,
                             superblocks, hle_routines, pruned_keys);
+        unsigned hook_count = 0u;
+        if (!hook_seams_mode.empty())
+            write_bank_hooks(out_dir, funcs, names, hook_keys, &hook_count);
         std::printf("\n[emit] bank '%s': %zu functions (%u body shard%s%s) -> %s/{%s,%s,%s}\n",
                     bank.c_str(), funcs.size(), emitted_shards,
                     emitted_shards == 1u ? "" : "s",
@@ -1701,6 +1943,10 @@ int main(int argc, char** argv) {
                     out_dir.c_str(),
                     names.body.c_str(), names.header.c_str(),
                     names.dispatch.c_str());
+        if (!hook_seams_mode.empty())
+            std::printf("[emit] hook seams (%s): %u/%zu functions -> %s/%s_hooks.c\n",
+                        hook_seams_mode.c_str(), hook_count, funcs.size(),
+                        out_dir.c_str(), names.bank.c_str());
         // Report the pass rather than asserting it: a leaf that stops
         // qualifying (a decoder change, a new terminator shape, a superblock
         // merge) shows up as the count moving, not as silent inaction.
