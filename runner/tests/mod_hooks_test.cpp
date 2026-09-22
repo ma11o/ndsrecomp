@@ -330,6 +330,50 @@ int main() {
               "the newest watch must have survived the eviction");
     }
 
+    // ── two guest threads on different stacks: a watch pushed for a
+    //    high-address stack (thread A) must not be disturbed by a later
+    //    watch pushed for an unrelated, lower-address stack (thread B) that
+    //    is still pending when A's own return is observed first. The
+    //    choke-point search matches by (return_key, entry_sp) and removes
+    //    only that one entry (nds_mod_hooks_check_return_slow's own
+    //    comment: "a later-pushed watch can belong to a different thread
+    //    ... on a stack that may sit at a lower address" -- this pins that
+    //    directly, rather than by push order or by simply popping whatever
+    //    is on top of the watch stack).
+    {
+        reset_cpu();
+        NdsHookSlot slot = make_slot("b", 0x1000u, 0u);
+        slot.leave_fn = reinterpret_cast<void*>(&recording_leave);
+        g_enter_result = NDS_HOOK_CONTINUE;
+        // Thread A: called from 0x1300, stack near the top of main RAM.
+        g_cpu.R[13] = 0x027E3000u; g_cpu.R[14] = 0x1300u; g_cpu.R[15] = 0x1000u;
+        runtime_hook_enter(&slot);
+        // Thread B: pushed after A, from a different call site, on a stack
+        // at a much lower address -- e.g. a second guest thread's own
+        // stack allocation.
+        g_cpu.R[13] = 0x02100000u; g_cpu.R[14] = 0x1400u; g_cpu.R[15] = 0x1000u;
+        runtime_hook_enter(&slot);
+        expect(nds_mod_hooks_test_watch_depth(NDS_ARM9) == 2u,
+              "both threads' watches are pending");
+        // A's return is observed first, even though B was pushed later.
+        g_cpu.R[13] = 0x027E3000u;
+        nds_mod_hooks_check_return(0x1300u);
+        expect(g_leave_calls == 1, "A's return must fire exactly one leave");
+        expect(g_last_leave_ctx.entry_sp == 0x027E3000u,
+              "the fired watch must be A's, not whichever was pushed last");
+        expect(nds_mod_hooks_test_watch_depth(NDS_ARM9) == 1u,
+              "removing A's watch must leave B's watch pending, not clear "
+              "the whole stack");
+        // B's watch is untouched: it fires later, on its own return.
+        g_cpu.R[13] = 0x02100000u;
+        nds_mod_hooks_check_return(0x1400u);
+        expect(g_leave_calls == 2, "B's return must fire its own leave");
+        expect(g_last_leave_ctx.entry_sp == 0x02100000u,
+              "the second fire must be B's watch");
+        expect(nds_mod_hooks_test_watch_depth(NDS_ARM9) == 0u,
+              "both threads' watches consumed");
+    }
+
     // ── unknown (bank, addr) registration fails loudly.
     {
         reset_cpu();

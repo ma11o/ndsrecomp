@@ -37,6 +37,7 @@
 #include "spu.h"
 #include "tier3.h"
 #include "title_patches.h"
+#include "mod_hooks.h"
 
 extern "C" uint32_t g_runtime_break_pc;
 
@@ -58,6 +59,17 @@ using socket_t = int;
 namespace {
 
 std::function<void()> g_reset_fn;
+
+// Set by the "shutdown" command, checked by debug_serve()'s accept loop
+// (never by handle() itself -- handle() only ever formulates a response,
+// it must never unwind the socket it is still writing that response
+// through). This is the only way `--serve` mode's own accept-loop ever
+// exits on its own: without it, the only way to end a serve-mode session
+// is to kill the process from outside, which bypasses every atexit
+// handler and shutdown-time report (mod diagnostics included) -- fine for
+// a human closing a terminal, not fine for an automated harness that
+// needs those reports to actually observe anything.
+bool g_shutdown_requested = false;
 
 // Play-mode flag: set by debug_pump_start(). Execution-driving commands are
 // rejected while the SDL frontend owns execution (psxrecomp model — query
@@ -464,6 +476,15 @@ std::string handle(const std::string& line) {
     std::string cmd = json_str(line, "cmd");
 
     if (cmd == "ping") return "{\"pong\":true}";
+
+    // Graceful session end: lets a harness capture shutdown-time-only
+    // observability (nds_mod_hooks_report, a mod's own atexit summary,
+    // save flush) instead of always killing the process from outside,
+    // which reaches none of that.
+    if (cmd == "shutdown") {
+        g_shutdown_requested = true;
+        return "{\"ok\":true}";
+    }
 
     if (cmd == "reset") {
         if (!g_reset_fn) return "{\"error\":\"reset unsupported\"}";
@@ -1950,7 +1971,7 @@ void debug_serve(uint16_t port) {
     std::fprintf(stderr, "[debug] listening on 127.0.0.1:%u\n", port);
 
     bool fatal_backend_failure = false;
-    while (!fatal_backend_failure) {
+    while (!fatal_backend_failure && !g_shutdown_requested) {
         socket_t client = accept(listener, nullptr, nullptr);
         if (client == INVALID_SOCKET) continue;
 

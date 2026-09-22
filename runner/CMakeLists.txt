@@ -145,7 +145,13 @@ if(NDS_MOD_DIR)
         file(APPEND "${MOD_REGISTRY}"
             "extern \"C\" void nds_mod_init_${_stem}(void);\n")
     endforeach()
-    file(APPEND "${MOD_REGISTRY}" "\nvoid nds_mod_run_all_init(void) {\n")
+    # extern "C" here too, not just on the per-mod declarations above --
+    # main.cpp declares this aggregate entry point `extern "C"` (nds_mod.h's
+    # own calling convention), and this .cpp registry TU would otherwise
+    # give its definition ordinary C++ (mangled) linkage, leaving the
+    # extern "C" declaration in main.cpp unsatisfied at link time.
+    file(APPEND "${MOD_REGISTRY}"
+        "\nextern \"C\" void nds_mod_run_all_init(void) {\n")
     foreach(_stem IN LISTS _mod_stems)
         file(APPEND "${MOD_REGISTRY}"
             "    nds_mod_init_${_stem}();\n")

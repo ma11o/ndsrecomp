@@ -2318,6 +2318,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[run] debug server mode from reset\n");
         debug_set_reset_fn(boot);
         debug_serve(port);
+        // Same shutdown-time report the plain (non-serve) path prints below
+        // -- serve mode reaches this point too now that a client can end
+        // the session with the "shutdown" debug command (debug_server.cpp)
+        // instead of only ever being killed from outside, which bypasses
+        // this entirely.
+        nds_mod_hooks_report(stderr);
         dump_replay_status();
         const bool save_ok = nds_io_flush_cartridge_save();
         const bool firmware_ok = nds_io_flush_firmware_save();
